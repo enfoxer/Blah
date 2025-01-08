@@ -1,0 +1,784 @@
+I'll help you modify the code to use compute shader upscaling. First, we need to add these new members to the class (around line 70):
+
+```cpp
+    // Add after other struct definitions
+    struct {
+        VkPipeline pipeline{ VK_NULL_HANDLE };
+        VkPipelineLayout pipelineLayout{ VK_NULL_HANDLE };
+        VkDescriptorSetLayout descriptorSetLayout{ VK_NULL_HANDLE };
+        VkDescriptorSet descriptorSet{ VK_NULL_HANDLE };
+        VkCommandBuffer commandBuffer{ VK_NULL_HANDLE };
+        VkSemaphore computeCompleteSemaphore{ VK_NULL_HANDLE };
+    } compute;
+
+    // Add storage images for compute
+    struct {
+        VkImage image{ VK_NULL_HANDLE };
+        VkDeviceMemory memory{ VK_NULL_HANDLE };
+        VkImageView view{ VK_NULL_HANDLE };
+        VkFormat format;
+    } computeOutput;
+```
+
+Would you like me to continue with:
+1. The compute shader code
+2. The compute pipeline setup
+3. Modified render loop to use compute upscaling
+4. Command buffer synchronization
+
+Let me know which part you'd like to see next!​​​​​​​​​​​​​​​​
+
+
+I'll continue with the compute shader and setup. First, here's the compute shader code to save as "upscale.comp":
+
+```glsl
+#version 450
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+layout (binding = 0) uniform sampler2D inputImage;
+layout (binding = 1, rgba8) uniform image2D outputImage;
+
+void main() 
+{
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outputSize = imageSize(outputImage);
+    
+    if(pos.x >= outputSize.x || pos.y >= outputSize.y) {
+        return;
+    }
+
+    vec2 inputSize = vec2(textureSize(inputImage, 0));
+    vec2 uv = vec2(pos) / vec2(outputSize - 1);
+    
+    vec2 sourcePos = uv * (inputSize - 1);
+    vec2 f = fract(sourcePos);
+    ivec2 i = ivec2(sourcePos);
+    
+    // Bilinear filtering
+    vec4 c00 = texelFetch(inputImage, i + ivec2(0,0), 0);
+    vec4 c10 = texelFetch(inputImage, i + ivec2(1,0), 0);
+    vec4 c01 = texelFetch(inputImage, i + ivec2(0,1), 0);
+    vec4 c11 = texelFetch(inputImage, i + ivec2(1,1), 0);
+    
+    vec4 c0 = mix(c00, c10, f.x);
+    vec4 c1 = mix(c01, c11, f.x);
+    vec4 c = mix(c0, c1, f.y);
+    
+    imageStore(outputImage, pos, c);
+}
+```
+
+Now let's add the compute pipeline setup functions to the class:
+
+```cpp
+void setupCompute() {
+    // Create descriptor set layout
+    std::vector<VkDescriptorSetLayoutBinding> setLayoutBindings = {
+        // Binding 0: Input image (sampled)
+        {
+            0,                                  // binding
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,  // descriptorType
+            1,                                  // descriptorCount
+            VK_SHADER_STAGE_COMPUTE_BIT,       // stageFlags
+            nullptr                            // pImmutableSamplers
+        },
+        // Binding 1: Output image (storage)
+        {
+            1,                                  // binding
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,   // descriptorType
+            1,                                  // descriptorCount
+            VK_SHADER_STAGE_COMPUTE_BIT,       // stageFlags
+            nullptr                            // pImmutableSamplers
+        }
+    };
+
+    VkDescriptorSetLayoutCreateInfo descriptorLayout = {};
+    descriptorLayout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    descriptorLayout.bindingCount = static_cast<uint32_t>(setLayoutBindings.size());
+    descriptorLayout.pBindings = setLayoutBindings.data();
+    VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorLayout, nullptr, &compute.descriptorSetLayout));
+
+    // Create pipeline layout
+    VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo{};
+    pipelineLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutCreateInfo.setLayoutCount = 1;
+    pipelineLayoutCreateInfo.pSetLayouts = &compute.descriptorSetLayout;
+    VK_CHECK_RESULT(vkCreatePipelineLayout(device, &pipelineLayoutCreateInfo, nullptr, &compute.pipelineLayout));
+
+    // Create compute output image
+    VkImageCreateInfo imageCreateInfo{};
+    imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageCreateInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageCreateInfo.format = swapChain.colorFormat;
+    imageCreateInfo.extent.width = width;
+    imageCreateInfo.extent.height = height;
+    imageCreateInfo.extent.depth = 1;
+    imageCreateInfo.mipLevels = 1;
+    imageCreateInfo.arrayLayers = 1;
+    imageCreateInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageCreateInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageCreateInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK_RESULT(vkCreateImage(device, &imageCreateInfo, nullptr, &computeOutput.image));
+
+    VkMemoryRequirements memReqs;
+    vkGetImageMemoryRequirements(device, computeOutput.image, &memReqs);
+    VkMemoryAllocateInfo memAlloc{};
+    memAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    memAlloc.allocationSize = memReqs.size;
+    memAlloc.memoryTypeIndex = getMemoryTypeIndex(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &computeOutput.memory));
+    VK_CHECK_RESULT(vkBindImageMemory(device, computeOutput.image, computeOutput.memory, 0));
+
+    // Create sampler
+    VkSamplerCreateInfo samplerCreateInfo{};
+    samplerCreateInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerCreateInfo.magFilter = VK_FILTER_LINEAR;
+    samplerCreateInfo.minFilter = VK_FILTER_LINEAR;
+    samplerCreateInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerCreateInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCreateInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCreateInfo.mipLodBias = 0.0f;
+    samplerCreateInfo.maxAnisotropy = 1.0f;
+    samplerCreateInfo.minLod = 0.0f;
+    samplerCreateInfo.maxLod = 1.0f;
+    samplerCreateInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+
+    VkSampler sampler;
+    VK_CHECK_RESULT(vkCreateSampler(device, &samplerCreateInfo, nullptr, &sampler));
+
+    // Create compute pipeline
+    VkComputePipelineCreateInfo computePipelineCreateInfo{};
+    computePipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    computePipelineCreateInfo.layout = compute.pipelineLayout;
+    computePipelineCreateInfo.flags = 0;
+    
+    // Load compute shader
+    computePipelineCreateInfo.stage = loadShader("shaders/upscale.comp.spv", VK_SHADER_STAGE_COMPUTE_BIT);
+    
+    VK_CHECK_RESULT(vkCreateComputePipelines(device, pipelineCache, 1, &computePipelineCreateInfo, nullptr, &compute.pipeline));
+
+    // Create compute command buffer
+    VkCommandBufferAllocateInfo cmdBufAllocateInfo{};
+    cmdBufAllocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdBufAllocateInfo.commandPool = commandPool;
+    cmdBufAllocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdBufAllocateInfo.commandBufferCount = 1;
+    VK_CHECK_RESULT(vkAllocateCommandBuffers(device, &cmdBufAllocateInfo, &compute.commandBuffer));
+
+    // Create compute semaphore
+    VkSemaphoreCreateInfo semaphoreCreateInfo{};
+    semaphoreCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    VK_CHECK_RESULT(vkCreateSemaphore(device, &semaphoreCreateInfo, nullptr, &compute.computeCompleteSemaphore));
+}
+```
+
+Would you like me to continue with:
+1. The modified render loop that uses compute upscaling
+2. The compute command buffer recording
+3. The synchronization between graphics and compute
+4. Cleanup code for the new resources
+
+Let me know which part you'd like to see next!​​​​​​​​​​​​​​​​
+
+I'll continue with the modified render loop and command buffer handling. First, let's add the compute command buffer recording:
+
+```cpp
+void buildComputeCommandBuffer() {
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    VK_CHECK_RESULT(vkBeginCommandBuffer(compute.commandBuffer, &beginInfo));
+
+    // Transition render target for shader read
+    VkImageMemoryBarrier imageBarrier{};
+    imageBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    imageBarrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    imageBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageBarrier.image = renderTarget.image;
+    imageBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    imageBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    imageBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    
+    vkCmdPipelineBarrier(
+        compute.commandBuffer,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        0, nullptr,
+        0, nullptr,
+        1, &imageBarrier);
+
+    // Transition compute output image
+    imageBarrier.image = computeOutput.image;
+    imageBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imageBarrier.srcAccessMask = 0;
+    imageBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    
+    vkCmdPipelineBarrier(
+        compute.commandBuffer,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        0, nullptr,
+        0, nullptr,
+        1, &imageBarrier);
+
+    // Bind compute pipeline
+    vkCmdBindPipeline(compute.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, compute.pipeline);
+    vkCmdBindDescriptorSets(compute.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, 
+        compute.pipelineLayout, 0, 1, &compute.descriptorSet, 0, nullptr);
+
+    // Dispatch compute shader
+    uint32_t groupsX = (width + 15) / 16;
+    uint32_t groupsY = (height + 15) / 16;
+    vkCmdDispatch(compute.commandBuffer, groupsX, groupsY, 1);
+
+    // Transition compute output for transfer
+    imageBarrier.image = computeOutput.image;
+    imageBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imageBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    imageBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    imageBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    vkCmdPipelineBarrier(
+        compute.commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0, nullptr,
+        0, nullptr,
+        1, &imageBarrier);
+
+    VK_CHECK_RESULT(vkEndCommandBuffer(compute.commandBuffer));
+}
+```
+
+Now let's modify the render() function to include compute upscaling:
+
+```cpp
+void render() {
+    if (!prepared)
+        return;
+
+    // Wait for previous frame
+    vkWaitForFences(device, 1, &waitFences[currentFrame], VK_TRUE, UINT64_MAX);
+    VK_CHECK_RESULT(vkResetFences(device, 1, &waitFences[currentFrame]));
+
+    // Get next image
+    uint32_t imageIndex;
+    VkResult result = vkAcquireNextImageKHR(device, swapChain.swapChain, UINT64_MAX, 
+        presentCompleteSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        windowResize();
+        return;
+    }
+
+    // Update uniform buffer
+    updateUniformBuffers(currentFrame);
+
+    // Reset and record graphics command buffer
+    vkResetCommandBuffer(commandBuffers[currentFrame], 0);
+    recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
+
+    // Submit graphics work
+    VkPipelineStageFlags waitStages[] = { 
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT 
+    };
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = &presentCompleteSemaphores[currentFrame];
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffers[currentFrame];
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = &renderCompleteSemaphores[currentFrame];
+    
+    VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
+
+    // Record and submit compute command buffer
+    vkResetCommandBuffer(compute.commandBuffer, 0);
+    buildComputeCommandBuffer();
+
+    VkSubmitInfo computeSubmitInfo{};
+    computeSubmitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    computeSubmitInfo.waitSemaphoreCount = 1;
+    computeSubmitInfo.pWaitSemaphores = &renderCompleteSemaphores[currentFrame];
+    computeSubmitInfo.pWaitDstStageMask = &waitStages[1];
+    computeSubmitInfo.commandBufferCount = 1;
+    computeSubmitInfo.pCommandBuffers = &compute.commandBuffer;
+    computeSubmitInfo.signalSemaphoreCount = 1;
+    computeSubmitInfo.pSignalSemaphores = &compute.computeCompleteSemaphore;
+
+    VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &computeSubmitInfo, waitFences[currentFrame]));
+
+    // Present
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = &compute.computeCompleteSemaphore;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &swapChain.swapChain;
+    presentInfo.pImageIndices = &imageIndex;
+
+    result = vkQueuePresentKHR(queue, &presentInfo);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        windowResize();
+    }
+
+    currentFrame = (currentFrame + 1) % MAX_CONCURRENT_FRAMES;
+}
+```
+
+Would you like me to continue with:
+1. The cleanup code for compute resources
+2. The descriptor set updates for compute
+3. The modified window resize handling
+4. Any other parts of the implementation?
+
+Let me know what you'd like to see next!​​​​​​​​​​​​​​​​
+
+I'll continue with the cleanup, descriptor updates, and window resize handling:
+
+1. Add to the destructor (in ~VulkanExample()):
+
+```cpp
+    ~VulkanExample() {
+        // Add before other cleanup
+        vkDestroyPipeline(device, compute.pipeline, nullptr);
+        vkDestroyPipelineLayout(device, compute.pipelineLayout, nullptr);
+        vkDestroyDescriptorSetLayout(device, compute.descriptorSetLayout, nullptr);
+        vkDestroySemaphore(device, compute.computeCompleteSemaphore, nullptr);
+        
+        vkDestroyImage(device, computeOutput.image, nullptr);
+        vkDestroyImageView(device, computeOutput.view, nullptr);
+        vkFreeMemory(device, computeOutput.memory, nullptr);
+
+        // Existing cleanup code follows...
+    }
+```
+
+2. Add descriptor set update function:
+
+```cpp
+void updateComputeDescriptorSets() {
+    // Create image view for render target if not exists
+    if (renderTarget.view == VK_NULL_HANDLE) {
+        VkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = renderTarget.image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = renderTarget.format;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.layerCount = 1;
+        VK_CHECK_RESULT(vkCreateImageView(device, &viewInfo, nullptr, &renderTarget.view));
+    }
+
+    // Create image view for compute output if not exists
+    if (computeOutput.view == VK_NULL_HANDLE) {
+        VkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = computeOutput.image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = computeOutput.format;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.layerCount = 1;
+        VK_CHECK_RESULT(vkCreateImageView(device, &viewInfo, nullptr, &computeOutput.view));
+    }
+
+    // Create sampler if not exists
+    static VkSampler sampler = VK_NULL_HANDLE;
+    if (sampler == VK_NULL_HANDLE) {
+        VkSamplerCreateInfo samplerInfo{};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK_RESULT(vkCreateSampler(device, &samplerInfo, nullptr, &sampler));
+    }
+
+    // Allocate descriptor set
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = descriptorPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &compute.descriptorSetLayout;
+    VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &compute.descriptorSet));
+
+    // Update descriptor set
+    std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+    
+    VkDescriptorImageInfo inputImageInfo{};
+    inputImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    inputImageInfo.imageView = renderTarget.view;
+    inputImageInfo.sampler = sampler;
+
+    descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[0].dstSet = compute.descriptorSet;
+    descriptorWrites[0].dstBinding = 0;
+    descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorWrites[0].descriptorCount = 1;
+    descriptorWrites[0].pImageInfo = &inputImageInfo;
+
+    VkDescriptorImageInfo outputImageInfo{};
+    outputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    outputImageInfo.imageView = computeOutput.view;
+
+    descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[1].dstSet = compute.descriptorSet;
+    descriptorWrites[1].dstBinding = 1;
+    descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    descriptorWrites[1].descriptorCount = 1;
+    descriptorWrites[1].pImageInfo = &outputImageInfo;
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), 
+        descriptorWrites.data(), 0, nullptr);
+}
+```
+
+3. Modify the windowResize() function:
+
+```cpp
+void windowResize() {
+    // Wait for device idle
+    vkDeviceWaitIdle(device);
+
+    // Cleanup old resources
+    vkDestroyImageView(device, renderTarget.view, nullptr);
+    vkDestroyImage(device, renderTarget.image, nullptr);
+    vkFreeMemory(device, renderTarget.memory, nullptr);
+    
+    vkDestroyImageView(device, computeOutput.view, nullptr);
+    vkDestroyImage(device, computeOutput.image, nullptr);
+    vkFreeMemory(device, computeOutput.memory, nullptr);
+
+    // Update dimensions
+    renderTarget.width = width / 2;
+    renderTarget.height = height / 2;
+
+    // Recreate resources
+    createRenderTarget();
+    createComputeResources();
+    updateComputeDescriptorSets();
+
+    // Base class resize handling
+    VulkanExampleBase::windowResize();
+}
+```
+
+4. Add createComputeResources() function:
+
+```cpp
+void createComputeResources() {
+    // Create compute output image
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = swapChain.colorFormat;
+    imageInfo.extent = {width, height, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VK_CHECK_RESULT(vkCreateImage(device, &imageInfo, nullptr, &computeOutput.image));
+
+    VkMemoryRequirements memReqs;
+    vkGetImageMemoryRequirements(device, computeOutput.image, &memReqs);
+
+    VkMemoryAllocateInfo memAlloc{};
+    memAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    memAlloc.allocationSize = memReqs.size;
+    memAlloc.memoryTypeIndex = getMemoryTypeIndex(
+        memReqs.memoryTypeBits, 
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    );
+
+    VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &computeOutput.memory));
+    VK_CHECK_RESULT(vkBindImageMemory(device, computeOutput.image, computeOutput.memory, 0));
+
+    computeOutput.format = swapChain.colorFormat;
+}
+```
+
+5. Finally, modify prepare() to initialize compute resources:
+
+```cpp
+void prepare() {
+    VulkanExampleBase::prepare();
+    
+    renderTarget.width = width / 2;
+    renderTarget.height = height / 2;
+    renderTarget.format = swapChain.colorFormat;
+    
+    createRenderTarget();
+    createComputeResources();
+    setupCompute();
+    updateComputeDescriptorSets();
+    
+    createSynchronizationPrimitives();
+    createCommandBuffers();
+    createVertexBuffer();
+    createUniformBuffers();
+    createDescriptorSetLayout();
+    createDescriptorPool();
+    createDescriptorSets();
+    createPipelines();
+    
+    prepared = true;
+}
+```
+
+This completes the compute-based upscaling implementation. The key differences from the CPU version:
+1. Uses GPU compute shader for upscaling
+2. Better performance due to staying on GPU
+3. Proper synchronization between graphics and compute work
+4. No CPU-GPU transfers needed
+
+Would you like me to explain any part in more detail or show you how to add any additional features to the compute shader?​​​​​​​​​​​​​​​​
+
+I'll show you how to enhance the compute shader with better upscaling quality and additional features. First, let's create an improved compute shader:
+
+```glsl
+#version 450
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+layout (binding = 0) uniform sampler2D inputImage;
+layout (binding = 1, rgba8) uniform image2D outputImage;
+
+// Add uniform buffer for configuration
+layout (binding = 2) uniform UBO {
+    float sharpness;      // Control sharpness of upscaling
+    float denoise;        // Noise reduction
+    vec2 inputSize;       // Input image dimensions
+    vec2 outputSize;      // Output image dimensions
+} ubo;
+
+// Improved bicubic weight calculation
+float cubicWeight(float x) {
+    x = abs(x);
+    if (x <= 1.0) {
+        return (x * x * (2.0 * x - 3.0) + 1.0);
+    } else if (x < 2.0) {
+        return (x * (x * (-x + 5.0) - 8.0) + 4.0);
+    }
+    return 0.0;
+}
+
+// Enhanced sampling with edge detection
+vec4 sampleInput(vec2 uv) {
+    vec2 pixel = uv * ubo.inputSize;
+    vec2 pixelFloor = floor(pixel);
+    vec2 pixelFract = pixel - pixelFloor;
+    
+    vec4 color = vec4(0.0);
+    float totalWeight = 0.0;
+    
+    // 4x4 kernel for high-quality sampling
+    for (int y = -1; y <= 2; y++) {
+        for (int x = -1; x <= 2; x++) {
+            vec2 samplePos = (pixelFloor + vec2(x, y) + 0.5) / ubo.inputSize;
+            vec4 sample = texture(inputImage, samplePos);
+            
+            float wx = cubicWeight(pixelFract.x - float(x));
+            float wy = cubicWeight(pixelFract.y - float(y));
+            float weight = wx * wy;
+            
+            color += sample * weight;
+            totalWeight += weight;
+        }
+    }
+    
+    return color / totalWeight;
+}
+
+// Edge detection
+float detectEdge(vec2 uv) {
+    vec3 center = texture(inputImage, uv).rgb;
+    vec2 texelSize = 1.0 / ubo.inputSize;
+    
+    vec3 up = texture(inputImage, uv + vec2(0.0, texelSize.y)).rgb;
+    vec3 down = texture(inputImage, uv + vec2(0.0, -texelSize.y)).rgb;
+    vec3 left = texture(inputImage, uv + vec2(-texelSize.x, 0.0)).rgb;
+    vec3 right = texture(inputImage, uv + vec2(texelSize.x, 0.0)).rgb;
+    
+    vec3 dx = right - left;
+    vec3 dy = up - down;
+    
+    return length(dx) + length(dy);
+}
+
+void main() 
+{
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if(pos.x >= int(ubo.outputSize.x) || pos.y >= int(ubo.outputSize.y)) {
+        return;
+    }
+
+    vec2 uv = (vec2(pos) + 0.5) / ubo.outputSize;
+    
+    // Sample with improved algorithm
+    vec4 color = sampleInput(uv);
+    
+    // Edge-aware sharpening
+    float edgeStrength = detectEdge(uv);
+    float adaptiveSharpness = ubo.sharpness * (1.0 - edgeStrength);
+    
+    if (adaptiveSharpness > 0.0) {
+        vec4 original = color;
+        vec4 sharp = vec4(0.0);
+        vec2 texelSize = 1.0 / ubo.outputSize;
+        
+        // 3x3 sharpening kernel
+        sharp += -1.0 * texture(inputImage, uv + vec2(-texelSize.x, -texelSize.y));
+        sharp += -1.0 * texture(inputImage, uv + vec2(0, -texelSize.y));
+        sharp += -1.0 * texture(inputImage, uv + vec2(texelSize.x, -texelSize.y));
+        sharp += -1.0 * texture(inputImage, uv + vec2(-texelSize.x, 0));
+        sharp += 9.0 * texture(inputImage, uv);
+        sharp += -1.0 * texture(inputImage, uv + vec2(texelSize.x, 0));
+        sharp += -1.0 * texture(inputImage, uv + vec2(-texelSize.x, texelSize.y));
+        sharp += -1.0 * texture(inputImage, uv + vec2(0, texelSize.y));
+        sharp += -1.0 * texture(inputImage, uv + vec2(texelSize.x, texelSize.y));
+        
+        color = mix(original, sharp, adaptiveSharpness);
+    }
+    
+    // Denoise if enabled
+    if (ubo.denoise > 0.0) {
+        vec4 blur = vec4(0.0);
+        float total = 0.0;
+        vec2 texelSize = 1.0 / ubo.outputSize;
+        
+        for (int x = -2; x <= 2; x++) {
+            for (int y = -2; y <= 2; y++) {
+                vec2 offset = vec2(float(x), float(y)) * texelSize;
+                float weight = exp(-dot(offset, offset) * 4.0);
+                blur += texture(inputImage, uv + offset) * weight;
+                total += weight;
+            }
+        }
+        
+        blur /= total;
+        color = mix(color, blur, ubo.denoise);
+    }
+    
+    imageStore(outputImage, pos, color);
+}
+```
+
+Now let's add the uniform buffer support to our C++ code:
+
+```cpp
+// Add to class member definitions
+struct ComputeUBO {
+    float sharpness;
+    float denoise;
+    float inputWidth;
+    float inputHeight;
+    float outputWidth;
+    float outputHeight;
+    float padding[2];  // Keep alignment
+} computeUBO;
+
+struct {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    VkDescriptorSet descriptorSet;
+    void* mapped;
+} computeUniform;
+
+// Add function to create compute uniform buffer
+void createComputeUniformBuffer() {
+    VkDeviceSize bufferSize = sizeof(ComputeUBO);
+
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = bufferSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VK_CHECK_RESULT(vkCreateBuffer(device, &bufferInfo, nullptr, &computeUniform.buffer));
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(device, computeUniform.buffer, &memReqs);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = getMemoryTypeIndex(
+        memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    );
+
+    VK_CHECK_RESULT(vkAllocateMemory(device, &allocInfo, nullptr, &computeUniform.memory));
+    VK_CHECK_RESULT(vkBindBufferMemory(device, computeUniform.buffer, computeUniform.memory, 0));
+    VK_CHECK_RESULT(vkMapMemory(device, computeUniform.memory, 0, bufferSize, 0, &computeUniform.mapped));
+
+    // Initialize UBO
+    computeUBO.sharpness = 0.5f;
+    computeUBO.denoise = 0.1f;
+    computeUBO.inputWidth = renderTarget.width;
+    computeUBO.inputHeight = renderTarget.height;
+    computeUBO.outputWidth = width;
+    computeUBO.outputHeight = height;
+    
+    updateComputeUniformBuffer();
+}
+
+// Add function to update compute uniform buffer
+void updateComputeUniformBuffer() {
+    memcpy(computeUniform.mapped, &computeUBO, sizeof(ComputeUBO));
+}
+
+// Modify updateComputeDescriptorSets() to include the uniform buffer
+void updateComputeDescriptorSets() {
+    // Previous descriptor set updates...
+
+    // Add UBO descriptor write
+    VkDescriptorBufferInfo bufferInfo{};
+    bufferInfo.buffer = computeUniform.buffer;
+    bufferInfo.offset = 0;
+    bufferInfo.range = sizeof(ComputeUBO);
+
+    std::array<VkWriteDescriptorSet, 3> descriptorWrites{};
+    // ... Previous two descriptor writes ...
+
+    descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[2].dstSet = compute.descriptorSet;
+    descriptorWrites[2].dstBinding = 2;
+    descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    descriptorWrites[2].descriptorCount = 1;
+    descriptorWrites[2].pBufferInfo = &bufferInfo;
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), 
+        descriptorWrites.data(), 0, nullptr);
+}
+```
+
+Would you like me to:
+1. Show how to add real-time parameter adjustment
+2. Add more upscaling algorithms (FSRCNNX, etc.)
+3. Add performance metrics
+4. Show cleanup code for the new resources
+
+Let me know what interests you!​​​​​​​​​​​​​​​​
+
+
+
+
+
+
