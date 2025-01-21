@@ -1,0 +1,52 @@
+Let's try to debug this systematically. Could you add these checks before the submit:
+cppCopy// Add before the submit in the second copy stage
+if (submitInfo.sType != VK_STRUCTURE_TYPE_SUBMIT_INFO) {
+    printf("Submit info sType not set properly\n");
+}
+if (submitInfo.pCommandBuffers == nullptr) {
+    printf("Command buffer pointer is null\n");
+}
+if (secondCopyStage.fences[currentFrame] == VK_NULL_HANDLE) {
+    printf("Fence is null\n");
+}
+if (queue == VK_NULL_HANDLE) {
+    printf("Queue is null\n");
+    vkGetDeviceQueue(device, swapChain.queueNodeIndex, 0, &queue);
+}
+if (submitInfo.pWaitSemaphores == nullptr) {
+    printf("Wait semaphores pointer is null\n");
+}
+if (submitInfo.pWaitDstStageMask == nullptr) {
+    printf("Wait stage mask pointer is null\n");
+}
+if (submitInfo.pSignalSemaphores == nullptr) {
+    printf("Signal semaphores pointer is null\n");
+}
+
+// Then try the submit
+VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, secondCopyStage.fences[currentFrame]));
+This will help us identify which part is causing the segmentation fault. Could you run this and let me know which (if any) of these checks print an error message?
+Also, just to verify the setup, can you confirm that this stage's synchronization objects are being created properly by adding this check in createSynchronizationPrimitives:
+cppCopyvoid createSynchronizationPrimitives()
+{
+    // After creating secondCopyStage sync objects
+    if (secondCopyStage.fences[0] == VK_NULL_HANDLE) {
+        printf("Second copy stage fences not created properly\n");
+    }
+    if (secondCopyStage.completeSemaphores[0] == VK_NULL_HANDLE) {
+        printf("Second copy stage semaphores not created properly\n");
+    }
+} CopyRetryRbefore i try this do you think there is a cap on number of queues created on androidEditAh, that's a very insightful question! Yes, there could be a limitation on the number of concurrent queue operations on Android devices, especially since mobile GPUs often have more limited resources than desktop GPUs.
+Instead of creating additional queues, we should reuse the same queue but ensure proper synchronization. Could you check how many queues we're creating/using total? We should be using the same queue handle for all operations.
+Let's modify the approach:
+
+Use the same queue for all operations
+Remove any queue creation/fetch calls from the copy stages
+Make sure we're using the main queue from the base class
+
+Can you show me where all we're requesting or creating queues in the code? This might be the root cause of the Android crash.
+If we need to identify any device queue limits, we can check with:
+cppCopyVkPhysicalDeviceQueueFamilyProperties queueFamilyProps;
+uint32_t queueFamilyCount;
+vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, &queueFamilyProps);
+printf("Max queue count: %d\n", queueFamilyProps.queueCount);
