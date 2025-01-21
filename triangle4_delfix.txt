@@ -1,0 +1,78 @@
+
+The segmentation fault is likely because we need to wait on and reset the fence for the secondCopyStage at the beginning of the frame. Let's check where we wait for fences:
+
+In the render() function, we need to modify the fence waiting code at the beginning:
+
+cpp
+
+Copy
+// Wait for all stages to complete from previous frame
+std::array<VkFence, 4> stageFences = {  // Changed from 3 to 4 fences
+    renderStage.fences[currentFrame],
+    firstCopyStage.fences[currentFrame],
+    secondCopyStage.fences[currentFrame],  // Added this line
+    finalCopyStage.fences[currentFrame]
+};
+
+vkWaitForFences(device, stageFences.size(), stageFences.data(), VK_TRUE, UINT64_MAX);
+vkResetFences(device, stageFences.size(), stageFences.data());
+Also, make sure the fences for secondCopyStage are created in createSynchronizationPrimitives():
+
+cpp
+
+Copy
+void createSynchronizationPrimitives()
+{
+    createStageSyncObjects(renderStage, "render");
+    createStageSyncObjects(firstCopyStage, "firstCopy");
+    createStageSyncObjects(secondCopyStage, "secondCopy");  // Make sure this is called
+    createStageSyncObjects(finalCopyStage, "finalCopy");
+    
+    // Create present semaphores
+    VkSemaphoreCreateInfo semaphoreCI{};
+    semaphoreCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (uint32_t i = 0; i < MAX_CONCURRENT_FRAMES; i++) {
+        VK_CHECK_RESULT(vkCreateSemaphore(device, &semaphoreCI, nullptr, &presentCompleteSemaphores[i]));
+    }
+}
+This should resolve the segmentation fault by properly initializing and waiting on all stage fences.
+
+ Copy
+Retry
+
+
+
+For Android, we need to be extra careful about queue access. Let me check if the queue handle is actually valid when we're using it:
+
+First, let's verify where queue is coming from. In the original code, queue should be initialized in the base class, but let's explicitly check it:
+cpp
+
+Copy
+// Add before queue submit
+if (queue == VK_NULL_HANDLE) {
+    // Get queue if not already initialized
+    vkGetDeviceQueue(device, swapChain.queueNodeIndex, 0, &queue);
+}
+
+// Now do the submit
+VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, secondCopyStage.fences[currentFrame]));
+Or more thoroughly, we could add a queue handle specifically for our copy operations:
+
+cpp
+
+Copy
+// Add to class members
+VkQueue copyQueue{ VK_NULL_HANDLE };
+
+// In prepare() or init
+void prepare() {
+    // Get queue for copy operations
+    vkGetDeviceQueue(device, swapChain.queueNodeIndex, 0, &copyQueue);
+    // ... rest of prepare
+}
+
+// Then in the copy stage:
+VK_CHECK_RESULT(vkQueueSubmit(copyQueue, 1, &submitInfo, secondCopyStage.fences[currentFrame]));
+The segmentation fault on Android but not Windows suggests we might have a platform-specific queue handling issue. The above changes should help catch and fix that.
+
+Would you like me to show the complete modified context around this fix?
