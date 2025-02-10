@@ -1,0 +1,103 @@
+Ah, no - that's the issue! In `createPassthroughDescriptorSets()`, we shouldn't be using `VK_NULL_HANDLE` for the initial setup. This is likely causing our rendering issues.
+
+Here's the corrected version:
+
+```cpp
+void createPassthroughDescriptorSets(PassthroughStage& stage) {
+    // Allocate descriptor sets
+    std::vector<VkDescriptorSetLayout> layouts(MAX_CONCURRENT_FRAMES, stage.descriptorSetLayout);
+
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = stage.descriptorPool;
+    allocInfo.descriptorSetCount = MAX_CONCURRENT_FRAMES;
+    allocInfo.pSetLayouts = layouts.data();
+
+    VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, stage.descriptorSets.data()));
+
+    // We need to keep these alive until after vkUpdateDescriptorSets
+    std::vector<VkDescriptorImageInfo> imageInfos;
+    std::vector<VkWriteDescriptorSet> descriptorWrites;
+
+    for (size_t i = 0; i < MAX_CONCURRENT_FRAMES; i++) {
+        if (stage.isYuvInput) {
+            // Y plane
+            VkDescriptorImageInfo yImageInfo{};
+            yImageInfo.sampler = renderTarget2.sampler;  // Use appropriate sampler
+            yImageInfo.imageView = renderTarget2.views[0];  // Y plane view
+            yImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos.push_back(yImageInfo);
+
+            VkWriteDescriptorSet yWrite{};
+            yWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            yWrite.dstSet = stage.descriptorSets[i];
+            yWrite.dstBinding = 0;
+            yWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            yWrite.descriptorCount = 1;
+            yWrite.pImageInfo = &imageInfos.back();
+            descriptorWrites.push_back(yWrite);
+
+            // UV plane
+            VkDescriptorImageInfo uvImageInfo{};
+            uvImageInfo.sampler = renderTarget2.sampler;
+            uvImageInfo.imageView = renderTarget2.views[1];  // UV plane view
+            uvImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos.push_back(uvImageInfo);
+
+            VkWriteDescriptorSet uvWrite{};
+            uvWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            uvWrite.dstSet = stage.descriptorSets[i];
+            uvWrite.dstBinding = 1;
+            uvWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            uvWrite.descriptorCount = 1;
+            uvWrite.pImageInfo = &imageInfos.back();
+            descriptorWrites.push_back(uvWrite);
+        }
+        else {
+            // RGB texture
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.sampler = renderTarget1.sampler;
+            imageInfo.imageView = renderTarget1.views[0];
+            imageInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos.push_back(imageInfo);
+
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = stage.descriptorSets[i];
+            write.dstBinding = 0;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.descriptorCount = 1;
+            write.pImageInfo = &imageInfos.back();
+            descriptorWrites.push_back(write);
+        }
+
+        // Add UBO descriptor write
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = yuvUbo.buffer;
+        bufferInfo.offset = 0;
+        bufferInfo.range = sizeof(YuvUBO);
+
+        VkWriteDescriptorSet uboWrite{};
+        uboWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        uboWrite.dstSet = stage.descriptorSets[i];
+        uboWrite.dstBinding = stage.isYuvInput ? 2 : 1;  // Binding 2 for YUV, 1 for RGB
+        uboWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        uboWrite.descriptorCount = 1;
+        uboWrite.pBufferInfo = &bufferInfo;
+        descriptorWrites.push_back(uboWrite);
+    }
+
+    // Update all descriptor sets
+    if (!descriptorWrites.empty()) {
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()),
+            descriptorWrites.data(), 0, nullptr);
+    }
+}
+```
+
+The key changes are:
+1. Using valid sampler and imageView handles instead of VK_NULL_HANDLE
+2. Keeping the imageInfos vector alive until after vkUpdateDescriptorSets
+3. Using the correct render target views based on the stage type
+
+Try this change and let me know if you still see the green screen or if you get any validation errors.​​​​​​​​​​​​​​​​
