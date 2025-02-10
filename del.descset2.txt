@@ -1,0 +1,128 @@
+The issue is that we're using references to temporary vector elements. Let's fix this by ensuring our `imageInfos` stay valid:
+
+```cpp
+void createPassthroughDescriptorSets(PassthroughStage& stage) {
+    // Allocate descriptor sets
+    std::vector<VkDescriptorSetLayout> layouts(MAX_CONCURRENT_FRAMES, stage.descriptorSetLayout);
+
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = stage.descriptorPool;
+    allocInfo.descriptorSetCount = MAX_CONCURRENT_FRAMES;
+    allocInfo.pSetLayouts = layouts.data();
+
+    VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, stage.descriptorSets.data()));
+
+    // First create all image infos
+    std::vector<VkDescriptorImageInfo> imageInfos;
+    // Preallocate to avoid reallocation
+    imageInfos.reserve(MAX_CONCURRENT_FRAMES * (stage.isYuvInput ? 2 : 1));
+
+    // Create all image infos first
+    for (size_t i = 0; i < MAX_CONCURRENT_FRAMES; i++) {
+        if (stage.isYuvInput) {
+            // Y plane
+            VkDescriptorImageInfo yInfo{};
+            yInfo.sampler = renderTarget2.sampler;
+            yInfo.imageView = renderTarget2.views[0];
+            yInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos.push_back(yInfo);
+
+            // UV plane
+            VkDescriptorImageInfo uvInfo{};
+            uvInfo.sampler = renderTarget2.sampler;
+            uvInfo.imageView = renderTarget2.views[1];
+            uvInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos.push_back(uvInfo);
+        } else {
+            VkDescriptorImageInfo info{};
+            info.sampler = renderTarget1.sampler;
+            info.imageView = renderTarget1.views[0];
+            info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos.push_back(info);
+        }
+    }
+
+    // Now create descriptor writes using stable pointers to imageInfos
+    std::vector<VkWriteDescriptorSet> descriptorWrites;
+    size_t imageInfoIndex = 0;
+
+    for (size_t i = 0; i < MAX_CONCURRENT_FRAMES; i++) {
+        if (stage.isYuvInput) {
+            // Y plane write
+            VkWriteDescriptorSet yWrite{};
+            yWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            yWrite.dstSet = stage.descriptorSets[i];
+            yWrite.dstBinding = 0;
+            yWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            yWrite.descriptorCount = 1;
+            yWrite.pImageInfo = &imageInfos[imageInfoIndex++];
+            descriptorWrites.push_back(yWrite);
+
+            // UV plane write
+            VkWriteDescriptorSet uvWrite{};
+            uvWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            uvWrite.dstSet = stage.descriptorSets[i];
+            uvWrite.dstBinding = 1;
+            uvWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            uvWrite.descriptorCount = 1;
+            yWrite.pImageInfo = &imageInfos[imageInfoIndex++];
+            descriptorWrites.push_back(uvWrite);
+        } else {
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = stage.descriptorSets[i];
+            write.dstBinding = 0;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.descriptorCount = 1;
+            write.pImageInfo = &imageInfos[imageInfoIndex++];
+            descriptorWrites.push_back(write);
+        }
+
+        // UBO descriptor
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = yuvUbo.buffer;
+        bufferInfo.offset = 0;
+        bufferInfo.range = sizeof(YuvUBO);
+
+        VkWriteDescriptorSet uboWrite{};
+        uboWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        uboWrite.dstSet = stage.descriptorSets[i];
+        uboWrite.dstBinding = stage.isYuvInput ? 2 : 1;
+        uboWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        uboWrite.descriptorCount = 1;
+        uboWrite.pBufferInfo = &bufferInfo;
+        descriptorWrites.push_back(uboWrite);
+    }
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()),
+        descriptorWrites.data(), 0, nullptr);
+}
+```
+
+The key changes are:
+1. Pre-allocate the imageInfos vector to avoid reallocation
+2. Create all imageInfos first
+3. Create descriptor writes using direct pointers to the imageInfos vector elements
+4. Keep both vectors in scope until after vkUpdateDescriptorSets
+
+Also, you might want to add some validation before the update:
+
+```cpp
+// Add before vkUpdateDescriptorSets
+for (const auto& write : descriptorWrites) {
+    if (write.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+        if (!write.pImageInfo) {
+            throw std::runtime_error("Null image info pointer in descriptor write");
+        }
+        if (write.pImageInfo->sampler == VK_NULL_HANDLE) {
+            throw std::runtime_error("Null sampler in image info");
+        }
+        if (write.pImageInfo->imageView == VK_NULL_HANDLE) {
+            throw std::runtime_error("Null image view in image info");
+        }
+    }
+}
+```
+
+This should fix the corruption issue. Let me know if you still see any problems.​​​​​​​​​​​​​​​​
